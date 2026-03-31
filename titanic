@@ -1,0 +1,437 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import os
+
+# 设置随机种子保证可重复性
+torch.manual_seed(42)
+np.random.seed(42)
+
+# ==================== 1. 数据加载与清洗 ====================
+print("=== 加载数据 ===")
+train_df = pd.read_csv('titanic_train.csv')
+print(f"原始数据形状: {train_df.shape}")
+print(f"列名: {train_df.columns.tolist()}")
+
+# ==================== 2. 特征工程 ====================
+print("\n=== 特征工程 ===")
+
+# 2.1 处理缺失值（避免FutureWarning，使用推荐写法）
+train_df = train_df.copy()
+train_df['Age'] = train_df['Age'].fillna(train_df['Age'].median())
+train_df['Embarked'] = train_df['Embarked'].fillna(train_df['Embarked'].mode()[0])
+train_df['Fare'] = train_df['Fare'].fillna(train_df['Fare'].median())
+train_df.drop('Cabin', axis=1, inplace=True)  # 缺失太多，删除
+
+# 2.2 提取Title特征
+train_df['Title'] = train_df['Name'].str.extract(' ([A-Za-z]+)\.', expand=False)
+title_map = {
+    'Mr': 'Mr',
+    'Miss': 'Miss', 'Mlle': 'Miss', 'Ms': 'Miss',
+    'Mrs': 'Mrs', 'Mme': 'Mrs',
+    'Master': 'Master',
+    'Dr': 'Rare', 'Rev': 'Rare', 'Col': 'Rare',
+    'Major': 'Rare', 'Capt': 'Rare',
+    'Lady': 'Rare', 'Countess': 'Rare', 'Sir': 'Rare',
+    'Don': 'Rare', 'Jonkheer': 'Rare', 'Dona': 'Rare'
+}
+train_df['Title'] = train_df['Title'].map(title_map)
+train_df['Title'] = train_df['Title'].fillna('Rare')
+
+# 2.3 创建新特征
+train_df['FamilySize'] = train_df['SibSp'] + train_df['Parch'] + 1
+train_df['IsAlone'] = (train_df['FamilySize'] == 1).astype(int)
+
+# 2.4 删除无用列
+train_df.drop(['PassengerId', 'Name', 'Ticket'], axis=1, inplace=True)
+
+# 2.5 类别特征编码
+# 性别
+train_df['Sex'] = train_df['Sex'].map({'male': 0, 'female': 1})
+
+# Title独热编码
+title_dummies = pd.get_dummies(train_df['Title'], prefix='Title')
+train_df = pd.concat([train_df, title_dummies], axis=1)
+train_df.drop('Title', axis=1, inplace=True)
+
+# Embarked独热编码
+embarked_dummies = pd.get_dummies(train_df['Embarked'], prefix='Embarked')
+train_df = pd.concat([train_df, embarked_dummies], axis=1)
+train_df.drop('Embarked', axis=1, inplace=True)
+
+print(f"清洗后数据形状: {train_df.shape}")
+print(f"清洗后列名: {train_df.columns.tolist()}")
+
+# ==================== 3. 数据准备 ====================
+print("\n=== 数据准备 ===")
+
+# 分离特征和标签
+X = train_df.drop('Survived', axis=1).values.astype(np.float32)
+y = train_df['Survived'].values.astype(np.float32).reshape(-1, 1)
+
+# 标准化
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# 划分训练集和验证集 (8:2)
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"训练集: {X_train.shape}, 验证集: {X_val.shape}")
+
+# 转换为PyTorch Tensor
+X_train_tensor = torch.tensor(X_train)
+X_val_tensor = torch.tensor(X_val)
+y_train_tensor = torch.tensor(y_train)
+y_val_tensor = torch.tensor(y_val)
+
+# 创建DataLoader
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+
+batch_size = 32
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+
+# ==================== 4. 定义神经网络模型 ====================
+class TitanicNet(nn.Module):
+    def __init__(self, input_dim):
+        super(TitanicNet, self).__init__()
+
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(32, 16),
+            nn.ReLU(),
+
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+
+# 初始化模型
+input_dim = X_train.shape[1]
+model = TitanicNet(input_dim)
+print(f"\n=== 模型信息 ===")
+print(f"输入维度: {input_dim}")
+print(f"模型结构:\n{model}")
+
+# ==================== 5. 训练设置 ====================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+model = model.to(device)
+criterion = nn.BCELoss()  # 二元交叉熵损失
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+
+# 早停设置
+patience = 15
+best_val_loss = float('inf')
+epochs_no_improve = 0
+best_model_state = None
+
+# 记录训练历史
+train_losses = []
+val_losses = []
+val_accuracies = []
+
+# ==================== 6. 训练循环 ====================
+print("\n=== 开始训练 ===")
+num_epochs = 200
+
+for epoch in range(num_epochs):
+    # 训练阶段
+    model.train()
+    running_loss = 0.0
+
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(batch_X)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch_X.size(0)
+
+    train_loss = running_loss / len(train_loader.dataset)
+    train_losses.append(train_loss)
+
+    # 验证阶段
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch_X, batch_y in val_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            val_loss += loss.item() * batch_X.size(0)
+
+            # 计算准确率
+            predicted = (outputs > 0.5).float()
+            total += batch_y.size(0)
+            correct += (predicted == batch_y).sum().item()
+
+    val_loss /= len(val_loader.dataset)
+    val_losses.append(val_loss)
+    val_accuracy = 100 * correct / total
+    val_accuracies.append(val_accuracy)
+
+    # 学习率调整
+    scheduler.step(val_loss)
+
+    # 打印进度
+    if (epoch + 1) % 10 == 0 or epoch == 0:
+        print(f'Epoch [{epoch + 1:3d}/{num_epochs}] | '
+              f'Train Loss: {train_loss:.4f} | '
+              f'Val Loss: {val_loss:.4f} | '
+              f'Val Acc: {val_accuracy:.2f}%')
+
+    # 早停检查
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        epochs_no_improve = 0
+        best_model_state = model.state_dict().copy()
+    else:
+        epochs_no_improve += 1
+
+    if epochs_no_improve >= patience:
+        print(f'\n🎯 早停在 epoch {epoch + 1} (验证损失 {epochs_no_improve} 轮未改善)')
+        model.load_state_dict(best_model_state)  # 恢复最佳模型
+        break
+
+# ==================== 7. 最终评估 ====================
+print("\n=== 最终评估 ===")
+model.eval()
+with torch.no_grad():
+    X_val_tensor_device = X_val_tensor.to(device)
+    val_outputs = model(X_val_tensor_device)
+    val_predictions = (val_outputs > 0.5).float()
+
+    # 计算指标
+    correct = (val_predictions == y_val_tensor.to(device)).sum().item()
+    total = y_val_tensor.size(0)
+    final_accuracy = 100 * correct / total
+
+    # 精确率、召回率、F1
+    tp = ((val_predictions == 1) & (y_val_tensor.to(device) == 1)).sum().item()
+    fp = ((val_predictions == 1) & (y_val_tensor.to(device) == 0)).sum().item()
+    fn = ((val_predictions == 0) & (y_val_tensor.to(device) == 1)).sum().item()
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    print(f"验证集准确率: {final_accuracy:.2f}%")
+    print(f"精确率: {precision:.4f}")
+    print(f"召回率: {recall:.4f}")
+    print(f"F1分数: {f1:.4f}")
+
+# ==================== 8. 可视化训练过程 ====================
+# 修复中文字体问题
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+plt.figure(figsize=(12, 4))
+
+# 损失曲线
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# 准确率曲线
+plt.subplot(1, 2, 2)
+plt.plot(val_accuracies, label='Val Accuracy', color='green')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.title('Validation Accuracy')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# ==================== 9. 保存模型 ====================
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'input_dim': input_dim,
+    'scaler': scaler,
+    'feature_columns': train_df.drop('Survived', axis=1).columns.tolist()
+}, 'titanic_model.pth')
+
+print(f"\n✅ 模型已保存到: titanic_model.pth")
+print(f"特征列: {train_df.drop('Survived', axis=1).columns.tolist()}")
+
+# ==================== 10. 生成Kaggle提交文件 ====================
+print("\n" + "=" * 50)
+print("生成Kaggle提交文件")
+print("=" * 50)
+
+# 检查test.csv是否存在
+test_path = 'test.csv'
+if os.path.exists(test_path):
+    print(f"✅ 找到测试集文件: {test_path}")
+
+    try:
+        # 1. 加载测试集
+        test_df = pd.read_csv(test_path)
+        print(f"测试集形状: {test_df.shape}")
+
+        # 2. 保存乘客ID
+        passenger_ids = test_df['PassengerId'].copy()
+
+        # 3. 预处理（与训练集完全一致）
+        print("\n对测试集进行预处理...")
+
+        # 3.1 处理缺失值（使用训练集的统计量）
+        age_median = train_df['Age'].median()
+        fare_median = train_df['Fare'].median()
+        embarked_mode = train_df['Embarked'].mode()[0] if 'Embarked' in train_df.columns else 'S'
+
+        test_df['Age'] = test_df['Age'].fillna(age_median)
+        test_df['Fare'] = test_df['Fare'].fillna(fare_median)
+        test_df['Embarked'] = test_df['Embarked'].fillna(embarked_mode)
+
+        # 删除Cabin列
+        if 'Cabin' in test_df.columns:
+            test_df.drop('Cabin', axis=1, inplace=True)
+
+        # 3.2 特征工程
+        # Title
+        test_df['Title'] = test_df['Name'].str.extract(' ([A-Za-z]+)\.', expand=False)
+        test_df['Title'] = test_df['Title'].map(title_map)
+        test_df['Title'] = test_df['Title'].fillna('Rare')
+
+        # Family features
+        test_df['FamilySize'] = test_df['SibSp'] + test_df['Parch'] + 1
+        test_df['IsAlone'] = (test_df['FamilySize'] == 1).astype(int)
+
+        # Sex encoding
+        test_df['Sex'] = test_df['Sex'].map({'male': 0, 'female': 1})
+
+        # 3.3 独热编码
+        # Title独热编码
+        title_dummies_test = pd.get_dummies(test_df['Title'], prefix='Title')
+        # 确保有训练集中的所有列
+        for col in ['Title_Master', 'Title_Miss', 'Title_Mr', 'Title_Mrs', 'Title_Rare']:
+            if col not in title_dummies_test.columns:
+                title_dummies_test[col] = 0
+        # 只保留训练集有的列
+        title_cols = ['Title_Master', 'Title_Miss', 'Title_Mr', 'Title_Mrs', 'Title_Rare']
+        title_dummies_test = title_dummies_test[title_cols]
+        test_df = pd.concat([test_df, title_dummies_test], axis=1)
+
+        # Embarked独热编码
+        embarked_dummies_test = pd.get_dummies(test_df['Embarked'], prefix='Embarked')
+        for col in ['Embarked_C', 'Embarked_Q', 'Embarked_S']:
+            if col not in embarked_dummies_test.columns:
+                embarked_dummies_test[col] = 0
+        embarked_cols = ['Embarked_C', 'Embarked_Q', 'Embarked_S']
+        embarked_dummies_test = embarked_dummies_test[embarked_cols]
+        test_df = pd.concat([test_df, embarked_dummies_test], axis=1)
+
+        # 3.4 删除无用列
+        cols_to_drop = ['PassengerId', 'Name', 'Ticket', 'Title', 'Embarked', 'SibSp', 'Parch']
+        for col in cols_to_drop:
+            if col in test_df.columns:
+                test_df.drop(col, axis=1, inplace=True)
+
+        print(f"测试集处理后形状: {test_df.shape}")
+        print(f"测试集列: {test_df.columns.tolist()}")
+
+        # 4. 确保特征顺序与训练集一致
+        train_features = train_df.drop('Survived', axis=1).columns.tolist()
+        print(f"\n训练集特征 ({len(train_features)}个): {train_features}")
+
+        # 检查缺失的列
+        for col in train_features:
+            if col not in test_df.columns:
+                print(f"⚠️ 测试集缺失列 '{col}'，自动添加为0")
+                test_df[col] = 0
+
+        # 删除多余的列
+        extra_cols = [col for col in test_df.columns if col not in train_features]
+        if extra_cols:
+            print(f"⚠️ 删除测试集多余列: {extra_cols}")
+            test_df.drop(extra_cols, axis=1, inplace=True)
+
+        # 重新排序
+        test_df = test_df[train_features]
+
+        # 5. 标准化
+        X_test = test_df.values.astype(np.float32)
+        X_test = scaler.transform(X_test)  # 使用训练时的scaler
+
+        # 6. 预测
+        print("\n进行预测...")
+        model.eval()
+        with torch.no_grad():
+            X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+            outputs = model(X_test_tensor)
+            predictions = (outputs > 0.5).float().cpu().numpy().flatten().astype(int)
+
+        # 7. 生成提交文件
+        submission = pd.DataFrame({
+            'PassengerId': passenger_ids,
+            'Survived': predictions
+        })
+
+        submission_file = 'submission.csv'
+        submission.to_csv(submission_file, index=False)
+
+        print(f"\n✅ 提交文件已生成: {submission_file}")
+        print(f"✅ 预测统计:")
+        print(f"  存活: {predictions.sum()} 人")
+        print(f"  遇难: {len(predictions) - predictions.sum()} 人")
+        print(f"  存活率: {predictions.mean():.1%}")
+
+        # 显示前10个预测
+        print("\n前10个乘客预测:")
+        print(submission.head(10))
+
+    except Exception as e:
+        print(f"❌ 处理测试集时出错: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+else:
+    print(f"❌ 未找到测试集文件: {test_path}")
+    print("请确保test.csv与代码在同一目录下")
+    print("当前目录文件:", os.listdir('.'))
+
+print("\n" + "=" * 50)
+print("完成！")
+print("=" * 50)
+print("\n=== 后续步骤 ===")
+print("1. 将生成的 submission.csv 上传到 Kaggle")
+print("2. 访问: https://www.kaggle.com/c/titanic/submit")
+print("3. 查看你的分数和排名")
